@@ -27,7 +27,7 @@ export interface AnimSet {
 
 export interface GameAssets {
   player: AnimSet;
-  enemies: { punk: AnimSet; thug: AnimSet; heavy: AnimSet; raider: AnimSet; gunner: AnimSet; droid: AnimSet };
+  enemies: { punk: AnimSet; thug: AnimSet; heavy: AnimSet; raider: AnimSet; gunner: AnimSet; droid: AnimSet; boss: AnimSet };
   /** true when the real external sheets decoded (affects draw scale) */
   raiderSamurai: boolean;
   droidReal: boolean;
@@ -216,6 +216,34 @@ function recolorSet(set: AnimSet, hueDeg: number, satMult: number, lightAdd: num
   return out;
 }
 
+/** Overlays a translucent color on every frame (source-atop) — tints even grayscale art. */
+function tintStrip(strip: Strip, color: string, alpha: number, brighten = 0): Strip {
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.round(strip.w));
+  c.height = Math.max(1, Math.round(strip.h));
+  const ctx = c.getContext("2d")!;
+  if (brighten !== 0) {
+    ctx.filter = `brightness(${1 + brighten})`;
+  }
+  ctx.drawImage(strip.img as CanvasImageSource, 0, 0);
+  ctx.filter = "none";
+  ctx.globalCompositeOperation = "source-atop";
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = color;
+  ctx.fillRect(0, 0, c.width, c.height);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = "source-over";
+  const out = toStrip(c);
+  out.footPad = strip.footPad;
+  return out;
+}
+
+function tintSet(set: AnimSet, color: string, alpha: number, brighten = 0): AnimSet {
+  const out: AnimSet = {};
+  for (const k of Object.keys(set)) out[k] = tintStrip(set[k], color, alpha, brighten);
+  return out;
+}
+
 /* ---------- ACT 2 enemies: rebuild sprite sheets from Penusbmic's demo GIFs ---------- */
 
 interface GifRowMap { anim: string; row: number }
@@ -378,6 +406,8 @@ export async function loadAllAssets(
     raider: samuraiSet ?? recolorSet(player, 197, 0.8, 0.07),
     gunner: recolorSet(player, 165, 1.3, -0.03), // hazard-orange gunslinger
     droid: droidSet ?? recolorSet(player, -70, 1.2, -0.09),
+    // THE BOSS — אדון הסערה: the droid chassis repainted in ember-crimson warlord plating
+    boss: tintSet(droidSet ?? samuraiSet ?? recolorSet(player, -70, 1.2, -0.09), "#c81e2e", 0.42, 0.06),
   };
 
   return {
