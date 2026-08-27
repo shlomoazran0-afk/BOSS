@@ -27,7 +27,7 @@ export default function App() {
   const gameRef = useRef<Game | null>(null);
   const [mode, setMode] = useState<Mode>("loading");
   const [progress, setProgress] = useState({ loaded: 0, total: 1, label: "" });
-  const [stats, setStats] = useState<GameStats>({ score: 0, hiScore: 0, kills: 0, maxCombo: 0, wavesCleared: 0 });
+  const [stats, setStats] = useState<GameStats>({ score: 0, hiScore: 0, kills: 0, maxCombo: 0, wavesCleared: 0, bossDefeated: false });
   const [credits, setCredits] = useState(false);
   const [muted, setMuted] = useState(false);
   const [scale, setScale] = useState(2);
@@ -137,7 +137,7 @@ export default function App() {
                 סמטת<br />הזעם
               </h1>
               <div className="mt-2 text-[12px] text-[#b8b4d0] font-body font-medium">
-                שתי מערכות · שישה אזורים · גלי בריונים וקרבות ידיים חשופות
+                שתי מערכות · שישה אזורים · גלי בריונים — ובסוף מחכה <span className="text-neon-pink font-bold">אדון הסערה</span>
               </div>
             </div>
 
@@ -252,7 +252,7 @@ export default function App() {
             <div className="font-pixel text-[10px] text-toxic" dir="ltr">★ VICTORY ★</div>
             <h2 className="font-display text-5xl neon-text-cyan text-neon-cyan anim-slide-up">הרחוב שלך!</h2>
             <div className="text-[#c8c4e0] text-sm font-body anim-slide-up anim-slide-up-1">
-              מהסמטה ועד הרובע התעשייתי — כל ששת האזורים נוקו. העיר שוב שלך.
+              מהסמטה ועד הרובע התעשייתי — ששת האזורים נוקו ואדון הסערה מוטל ברחוב. העיר שוב שלך.
             </div>
             <StatsRow stats={stats} victory />
             <div className="flex gap-3 mt-2 anim-slide-up anim-slide-up-2">
@@ -316,6 +316,7 @@ function StatsRow({ stats, victory }: { stats: GameStats; victory?: boolean }) {
     ["קומבו מקסימלי", String(stats.maxCombo) + "×", "#ff2d78"],
     ["גלים", String(stats.wavesCleared), "#29e6ff"],
   ];
+  if (victory && stats.bossDefeated) items.push(["אדון הסערה", "הובס ⚔", "#ff5a3d"]);
   return (
     <div className="flex flex-wrap justify-center gap-2 mt-1" dir="rtl">
       {items.map(([label, val, color]) => (

@@ -17,6 +17,7 @@ export interface GameStats {
   kills: number;
   maxCombo: number;
   wavesCleared: number;
+  bossDefeated: boolean;
 }
 
 export interface EngineCallbacks {
@@ -80,12 +81,13 @@ const MOVES: Record<string, MoveDef> = {
 
 /* ---------------- enemies ---------------- */
 
-type EnemyKind = "punk" | "thug" | "heavy" | "raider" | "gunner" | "droid";
+type EnemyKind = "punk" | "thug" | "heavy" | "raider" | "gunner" | "droid" | "boss";
 
 /** hurtbox [halfWidth, height] for enemies whose art isn't the 200px hero cell */
 const KIND_BODY: Partial<Record<EnemyKind, [number, number]>> = {
   raider: [24, 90], // Storm Samurai — low, wide dasher
   droid: [32, 140], // Storm Head Droid — hulking battle robot
+  boss: [46, 182], // אדון הסערה — the warlord towers over the alley
 };
 
 interface EnemyDef {
@@ -135,7 +137,32 @@ const ENEMY_DEFS: Record<EnemyKind, EnemyDef> = {
     cooldown: 1.9, windup: 0.46, scale: 0.81, score: 600, armor: false, ranged: true,
     move: { anim: "Attack1", fps: 13, dmg: 9, kb: 150, stun: 0.32, reach: 0, from: 0.35, to: 0.65, lunge: 0 },
   },
+  boss: {
+    name: "אדון הסערה", hp: 620, speed: 86, dmg: 16, range: 135, aggro: 9999,
+    cooldown: 1.5, windup: 0.5, scale: 1.55, score: 5000, armor: true,
+    move: { anim: "Attack1", fps: 13, dmg: 14, kb: 300, stun: 0.5, reach: 135, from: 0.32, to: 0.6, lunge: 70 },
+  },
 };
+
+/* ---------------- BOSS — אדון הסערה ---------------- */
+
+const BOSS_MOVES: Record<string, MoveDef> = {
+  slash1: { anim: "Attack1", fps: 13, dmg: 14, kb: 300, stun: 0.5, reach: 135, from: 0.32, to: 0.6, lunge: 70 },
+  slash2: { anim: "Attack1", fps: 11, dmg: 18, kb: 380, stun: 0.55, reach: 152, from: 0.3, to: 0.62, lunge: 90 },
+  dash: { anim: "Attack1", fps: 18, dmg: 16, kb: 360, stun: 0.5, reach: 100, from: 0, to: 1, lunge: 0 },
+  slam: { anim: "Attack1", fps: 9, dmg: 20, kb: 420, stun: 0.6, reach: 84, from: 0, to: 1, lunge: 0 },
+  fanBullet: { anim: "Attack1", fps: 1, dmg: 10, kb: 220, stun: 0.36, reach: 0, from: 0, to: 1, lunge: 0 },
+  shock: { anim: "Attack1", fps: 1, dmg: 12, kb: 280, stun: 0.42, reach: 0, from: 0, to: 1, lunge: 0 },
+};
+
+/** per-phase combat profile: speed / attack cooldown / windup / melee swings per combo */
+function bossParams(phase: number) {
+  return phase === 1
+    ? { speed: 76, atkCd: 1.6, windup: 0.5, comboMax: 1 }
+    : phase === 2
+      ? { speed: 96, atkCd: 1.15, windup: 0.4, comboMax: 2 }
+      : { speed: 118, atkCd: 0.85, windup: 0.32, comboMax: 2 };
+}
 
 const BULLET_MOVE: MoveDef = { anim: "Attack1", fps: 1, dmg: 9, kb: 150, stun: 0.32, reach: 0, from: 0, to: 1, lunge: 0 };
 
@@ -180,7 +207,9 @@ interface FloatText { x: number; y: number; txt: string; color: string; t: numbe
 
 interface RainDrop { x: number; y: number; len: number; spd: number }
 
-interface Bullet { x: number; y: number; vx: number; life: number; shooter: Enemy }
+interface Bullet { x: number; y: number; vx: number; vy?: number; life: number; shooter: Enemy; tint?: string; big?: boolean }
+
+interface Shockwave { x: number; y: number; dir: 1 | -1; life: number; hit: boolean }
 
 interface Ember { x: number; y: number; vy: number; drift: number; size: number; tw: number }
 
@@ -251,6 +280,17 @@ class Enemy extends Fighter {
   hasHitPlayer = false;
   scoreGiven = false;
 
+  // ── boss brain ──
+  bossPhase = 1;
+  bossCombo = 0;
+  bossNext: "slash" | "dash" | "slam" | "fan" | null = null;
+  bossWindT = 0;
+  bossTargetX = 0;
+  fanCd = 0;
+  slamCd = 0;
+  dashCd = 0;
+  summonUsed = false;
+
   constructor(kind: EnemyKind, x: number, y: number) {
     super();
     this.kind = kind;
@@ -290,6 +330,13 @@ export class Game {
   private embers: Ember[] = [];
   private actFlashT = 0;
 
+  // ── boss encounter ──
+  private boss: Enemy | null = null;
+  private bossState: "none" | "intro" | "fight" | "defeated" = "none";
+  private bossGhostHp = 0;
+  private bossDefeated = false;
+  private shockwaves: Shockwave[] = [];
+
   private keys = new Set<string>();
   private bufferAttack = 0;
   private bufferKick = 0;
@@ -299,7 +346,7 @@ export class Game {
   private camX = 0;
   private zoneIdx = 0;
   private waveIdx = 0;
-  private waveState: "announce" | "fighting" | "cleared" | "go" = "announce";
+  private waveState: "announce" | "fighting" | "cleared" | "go" | "boss" = "announce";
   private waveT = 0;
   private spawnQueue: Array<{ kind: EnemyKind; at: number; side: 1 | -1 }> = [];
   private wavesCleared = 0;
@@ -391,6 +438,7 @@ export class Game {
     this.pickups = [];
     this.cans = [];
     this.camX = 0;
+    this.resetBoss();
     this.setMode("attract");
   }
 
@@ -398,6 +446,7 @@ export class Game {
     return {
       score: this.score, hiScore: this.hiScore, kills: this.player.kills,
       maxCombo: this.player.maxCombo, wavesCleared: this.wavesCleared,
+      bossDefeated: this.bossDefeated,
     };
   }
 
@@ -462,6 +511,7 @@ export class Game {
     this.wavesCleared = 0;
     this.freezeT = 0;
     this.bullets = [];
+    this.resetBoss();
     // scatter destructible trash cans across both acts
     this.cans = [];
     const canXs = [330, 620, 1150, 1500, 2050, 2420, 2700, 3150, 3520, 4050, 4420, 4900, 5300];
@@ -477,6 +527,11 @@ export class Game {
     this.waveIdx++;
     const zone = ZONE_WAVES[this.zoneIdx];
     if (this.waveIdx >= zone.length) {
+      // final zone cleared → the warlord himself steps in
+      if (this.zoneIdx === ZONE_COUNT - 1) {
+        this.startBoss();
+        return;
+      }
       // zone cleared → unlock camera
       this.waveState = "go";
       this.score += 1000;
@@ -510,6 +565,7 @@ export class Game {
   }
 
   private updateWaves(dt: number) {
+    if (this.waveState === "boss") return; // handled by the boss encounter
     if (this.waveState === "announce") {
       this.waveT -= dt;
       if (this.waveT <= 0) this.waveState = "fighting";
@@ -570,6 +626,363 @@ export class Game {
     this.updateHi();
     this.audio.synth("horn");
     this.setMode("victory");
+  }
+
+  /* ---------- BOSS — אדון הסערה ---------- */
+
+  private resetBoss() {
+    this.boss = null;
+    this.bossState = "none";
+    this.bossGhostHp = 0;
+    this.bossDefeated = false;
+    this.shockwaves = [];
+  }
+
+  private startBoss() {
+    this.waveState = "boss";
+    this.bossState = "intro";
+    this.shockwaves = [];
+    this.bullets = [];
+    const x = this.camX + VIEW_W + 90;
+    const b = new Enemy("boss", x, GROUND_MAX - 4);
+    b.facing = -1;
+    b.state = "enter";
+    b.spawnT = 0.35;
+    this.enemies.push(b);
+    this.boss = b;
+    this.bossGhostHp = b.maxHp;
+    this.showBanner("אדון הסערה", "ראש הכנופיות — הקרב האחרון!");
+    this.audio.synth("horn");
+    this.shake(5);
+    this.actFlashT = 0.7;
+    this.burst(b.x, b.y - 100, 30, "#ff5a3d", 180, 0.55);
+    this.burst(b.x, b.y - 100, 14, "#ffd98a", 120, 0.4);
+    // a mercy pack before the duel
+    this.pickups.push({ x: this.camX + VIEW_W * 0.3, y: GROUND_MAX - 8, t: 0, ttl: 30 });
+  }
+
+  /** per-frame boss encounter bookkeeping: victory, ghost hp, shockwaves */
+  private updateBossEncounter(dt: number) {
+    const b = this.boss;
+    if (!b || this.bossState === "none") return;
+
+    if (this.bossState === "defeated") {
+      if (b.gone) {
+        this.bossState = "none";
+        this.winGame();
+      }
+      return;
+    }
+
+    this.bossGhostHp = Math.max(b.hp, this.bossGhostHp - 34 * dt);
+
+    // ground shockwaves from the slam
+    const p = this.player;
+    for (let i = this.shockwaves.length - 1; i >= 0; i--) {
+      const w = this.shockwaves[i];
+      w.x += w.dir * 252 * dt;
+      w.life -= dt;
+      if (w.life <= 0 || w.x < this.camX - 50 || w.x > this.camX + VIEW_W + 50) {
+        this.shockwaves.splice(i, 1);
+        continue;
+      }
+      if (this.particles.length < 300) this.burst(w.x, w.y - 4, 1, "#ff9a4d", 46, 0.24);
+      if (
+        !w.hit && !p.dead && p.invulnT <= 0 && p.z < 15 &&
+        Math.abs(p.x - w.x) < 17 && Math.abs(p.y - w.y) < 30
+      ) {
+        w.hit = true;
+        this.applyHit(b, p, BOSS_MOVES.shock);
+      }
+    }
+  }
+
+  private updateBoss(e: Enemy, dt: number) {
+    const p = this.player;
+    e.invulnT = Math.max(0, e.invulnT - dt);
+    e.fanCd = Math.max(0, e.fanCd - dt);
+    e.slamCd = Math.max(0, e.slamCd - dt);
+    e.dashCd = Math.max(0, e.dashCd - dt);
+
+    const prm = bossParams(e.bossPhase);
+    const arenaMin = this.camX + 48;
+    const arenaMax = this.camX + VIEW_W - 48;
+
+    // ── phase transitions ──
+    const frac = e.hp / e.maxHp;
+    const wantPhase = frac <= 1 / 3 ? 3 : frac <= 2 / 3 ? 2 : 1;
+    const busy = e.state === "attack" || e.state === "dash" || e.state === "slamJump" || e.state === "transition" || e.state === "enter";
+    if (wantPhase > e.bossPhase && !busy && e.state !== "dying") {
+      e.bossPhase = wantPhase;
+      e.state = "transition";
+      e.stateT = 0;
+      e.move = null;
+      e.bossNext = null;
+      e.cooldownT = 0;
+      this.showBanner(e.bossPhase === 2 ? "אדון הסערה זועם!" : "האחרון שנשאר!", `שלב ${e.bossPhase} — היזהר`);
+      this.shake(6);
+      this.audio.synth("horn");
+      this.burst(e.x, e.y - e.hh * 0.6, 26, "#ff5a3d", 200, 0.5);
+      this.burst(e.x, e.y - e.hh * 0.3, 14, "#ffd98a", 150, 0.4);
+      // heal pack + (final phase) reinforcement call
+      this.pickups.push({ x: clamp(this.player.x + rand(-70, 70), this.camX + 60, this.camX + VIEW_W - 60), y: GROUND_MAX - 8, t: 0, ttl: 26 });
+      if (e.bossPhase === 3 && !e.summonUsed) {
+        e.summonUsed = true;
+        this.addText(e.x, e.y - e.hh - 16, "תגי עזרה!", "#ff5a3d", true);
+        for (const side of [-1, 1] as const) {
+          const x = side === -1 ? this.camX - 80 : this.camX + VIEW_W + 80;
+          const m = new Enemy("raider", x, clamp(p.y + rand(-20, 20), GROUND_MIN, GROUND_MAX));
+          m.spawnT = 0.35;
+          m.facing = side === -1 ? 1 : -1;
+          this.enemies.push(m);
+        }
+      }
+      return;
+    }
+
+    switch (e.state) {
+      case "enter": {
+        // dramatic walk-in from the right edge
+        e.invulnT = 0.6;
+        const stopX = this.camX + VIEW_W - 130;
+        e.facing = -1;
+        this.setAnimState(e, "run");
+        e.x -= 110 * dt;
+        if (this.particles.length < 300 && Math.random() < 0.4) {
+          this.burst(e.x + rand(-30, 30), e.y - rand(0, 30), 1, "#ff5a3d", 60, 0.35);
+        }
+        if (e.x <= stopX) {
+          e.state = "transition";
+          e.stateT = 0;
+          this.bossState = "fight";
+          this.shake(4);
+          this.audio.synth("special");
+          this.burst(e.x, e.y - e.hh * 0.5, 18, "#ff5a3d", 150, 0.45);
+        }
+        e.x = clamp(e.x, arenaMin, arenaMax + 140);
+        return;
+      }
+
+      case "transition": {
+        e.invulnT = 0.6;
+        this.setAnimState(e, "idle");
+        e.flashT = Math.sin(this.time * 30) > 0 ? 0.1 : 0; // enrage flicker
+        if (e.stateT > 1.25) {
+          e.state = "chase";
+          e.stateT = 0;
+          e.flashT = 0;
+        }
+        return;
+      }
+
+      case "chase": {
+        if (p.dead) { this.setAnimState(e, "idle"); return; }
+        e.facing = p.x > e.x ? 1 : -1;
+        // orbit the player at blade range
+        if (e.aiT > 2.6) { e.aiT = 0; if (Math.random() < 0.5) e.side = e.side === 1 ? -1 : 1; }
+        const standX = p.x - e.side * 96;
+        const dxs = standX - e.x;
+        const dys = clamp(p.y + e.side * 8, GROUND_MIN, GROUND_MAX) - e.y;
+        const dist = Math.hypot(dxs, dys);
+        if (dist > 4) {
+          e.x += (dxs / dist) * prm.speed * dt;
+          e.y = clamp(e.y + (dys / dist) * prm.speed * 0.6 * dt, GROUND_MIN, GROUND_MAX);
+        }
+        this.setAnimState(e, dist > 8 ? "run" : "idle");
+        e.x = clamp(e.x, arenaMin, arenaMax);
+        if (e.cooldownT > 0) return;
+
+        const adx = Math.abs(p.x - e.x);
+        const ady = Math.abs(p.y - e.y);
+        if (ady > 30) return;
+        // pick an attack
+        if (e.bossPhase >= 2 && adx < 175 && e.slamCd <= 0 && Math.random() < 0.55) {
+          e.bossCombo = 0;
+          this.bossWindup(e, "slam", prm.windup * 1.15);
+        } else if (e.bossPhase >= 3 && adx > 130 && adx < 430 && e.fanCd <= 0 && Math.random() < 0.5) {
+          this.bossWindup(e, "fan", prm.windup);
+        } else if (adx > 330 && e.dashCd <= 0) {
+          this.bossWindup(e, "dash", prm.windup * 1.1);
+        } else if (adx < e.def.range + 26) {
+          e.bossCombo = 0;
+          this.bossWindup(e, "slash", prm.windup);
+        }
+        return;
+      }
+
+      case "windup": {
+        this.setAnimState(e, "idle");
+        e.facing = p.x > e.x ? 1 : -1;
+        if (e.stateT >= e.bossWindT) {
+          e.stateT = 0;
+          switch (e.bossNext) {
+            case "dash": {
+              e.state = "dash";
+              e.bossTargetX = p.x;
+              this.audio.synth("whoosh");
+              this.burst(e.x, e.y - e.hh * 0.45, 8, "#ff5a3d", 110, 0.3);
+              break;
+            }
+            case "slam": {
+              e.state = "slamJump";
+              e.vz = 430;
+              e.z = 0.02;
+              e.bossTargetX = p.x;
+              e.hasHitPlayer = false;
+              this.audio.synth("jump");
+              break;
+            }
+            case "fan": {
+              e.state = "fan";
+              e.hasHitPlayer = false;
+              break;
+            }
+            default: {
+              e.state = "attack";
+              e.hasHitPlayer = false;
+              this.bossStartSlash(e, e.bossCombo > 0 ? BOSS_MOVES.slash2 : BOSS_MOVES.slash1);
+              this.audio.synth("whoosh");
+            }
+          }
+          e.bossNext = null;
+        }
+        return;
+      }
+
+      case "attack": {
+        const m = e.move!;
+        const prog = e.stateT / e.moveDur;
+        if (prog < 0.3) e.x += e.facing * m.lunge * dt * 2.0;
+        e.x = clamp(e.x, arenaMin - 20, arenaMax + 20);
+        if (!e.hasHitPlayer && prog >= m.from && prog <= m.to) {
+          this.bossMeleeCheck(e, m);
+        }
+        if (e.stateT >= e.moveDur) {
+          // chain into the second slash
+          if (e.bossCombo < prm.comboMax - 1) {
+            e.bossCombo++;
+            e.state = "windup";
+            e.stateT = 0;
+            e.bossWindT = 0.2;
+            e.bossNext = "slash";
+            return;
+          }
+          e.state = "recover";
+          e.stateT = 0;
+          e.move = null;
+          e.cooldownT = prm.atkCd * rand(0.9, 1.15);
+        }
+        return;
+      }
+
+      case "dash": {
+        this.setAnimState(e, "run");
+        const dir = e.facing;
+        e.x += dir * (e.bossPhase >= 3 ? 620 : 540) * dt;
+        e.x = clamp(e.x, this.camX + 20, this.camX + VIEW_W - 20);
+        if (this.particles.length < 300 && Math.random() < 0.7) {
+          this.burst(e.x - dir * 30, e.y - rand(10, 90), 1, "#ff5a3d", 70, 0.3);
+        }
+        if (!e.hasHitPlayer && !p.dead && p.invulnT <= 0 && p.z < 70 &&
+            Math.abs(p.x - e.x) < e.hw + 26 && Math.abs(p.y - e.y) < 38) {
+          e.hasHitPlayer = true;
+          this.applyHit(e, p, BOSS_MOVES.dash);
+        }
+        if (e.stateT > 0.52 || (dir === 1 && e.x >= arenaMax) || (dir === -1 && e.x <= arenaMin)) {
+          e.state = "recover";
+          e.stateT = 0;
+          e.cooldownT = prm.atkCd * rand(0.9, 1.2);
+          e.dashCd = 4;
+        }
+        return;
+      }
+
+      case "slamJump": {
+        // airborne — steer toward the marked spot
+        e.x += clamp(e.bossTargetX - e.x, -170 * dt, 170 * dt);
+        e.x = clamp(e.x, arenaMin - 30, arenaMax + 30);
+        if (e.onGround && e.stateT > 0.25) {
+          // IMPACT
+          this.shake(7);
+          this.hitstop(0.08);
+          this.audio.playSample("hitHeavy", rand(0.9, 1.05));
+          this.burst(e.x, e.y - 6, 26, "#ff9a4d", 210, 0.5);
+          this.burst(e.x, e.y - 6, 12, "#ffd98a", 150, 0.4);
+          for (const dir of [1, -1] as const) {
+            this.shockwaves.push({ x: e.x + dir * 42, y: e.y, dir, life: 1.5, hit: false });
+          }
+          if (!p.dead && p.invulnT <= 0 && p.z < 34 && Math.abs(p.x - e.x) < 84 && Math.abs(p.y - e.y) < 32) {
+            this.applyHit(e, p, BOSS_MOVES.slam);
+          }
+          e.state = "recover";
+          e.stateT = 0;
+          e.move = null;
+          e.cooldownT = prm.atkCd * 1.2;
+          e.slamCd = 5;
+        }
+        return;
+      }
+
+      case "fan": {
+        this.setAnimState(e, "idle");
+        if (!e.hasHitPlayer && e.stateT > 0.42) {
+          e.hasHitPlayer = true;
+          const dir = p.x > e.x ? 1 : -1;
+          e.facing = dir;
+          const by = e.y - e.hh * 0.6;
+          for (const vy of [-52, 0, 52]) {
+            this.bullets.push({ x: e.x + dir * (e.hw + 8), y: by + vy * 0.35, vx: dir * 305, vy, life: 2.6, shooter: e, tint: "#ff6b4a", big: true });
+          }
+          this.burst(e.x + dir * e.hw, by, 8, "#ff6b4a", 120, 0.25);
+          this.audio.playSample("hitLight", rand(1.6, 1.9), 0.5);
+          this.audio.synth("whoosh");
+        }
+        if (e.stateT > 0.85) {
+          e.state = "recover";
+          e.stateT = 0;
+          e.cooldownT = prm.atkCd * rand(0.95, 1.2);
+          e.fanCd = 4.5;
+        }
+        return;
+      }
+
+      case "recover": {
+        this.setAnimState(e, "idle");
+        if (e.stateT > 0.55) { e.state = "chase"; e.stateT = 0; }
+        return;
+      }
+    }
+  }
+
+  /** open a telegraphed windup for a chosen boss attack */
+  private bossWindup(e: Enemy, next: "slash" | "dash" | "slam" | "fan", t: number) {
+    e.state = "windup";
+    e.stateT = 0;
+    e.bossNext = next;
+    e.bossWindT = t;
+  }
+
+  private bossStartSlash(e: Enemy, m: MoveDef) {
+    e.move = m;
+    e.moveDur = (() => {
+      const strip = this.stripFor(e, m.anim);
+      return strip ? strip.count / m.fps : 0.45;
+    })();
+    e.swingHit.clear();
+  }
+
+  /** sword hit vs the player (boss melee swings) */
+  private bossMeleeCheck(e: Enemy, m: MoveDef) {
+    const p = this.player;
+    if (p.dead || p.invulnT > 0 || p.z > 62 || Math.abs(p.y - e.y) > 36) return;
+    const x0 = e.x + e.facing * 14;
+    const x1 = e.x + e.facing * (m.reach + 20);
+    const minX = Math.min(x0, x1), maxX = Math.max(x0, x1);
+    const [bx, , bw] = p.hurtbox();
+    if (bx + bw > minX && bx < maxX) {
+      e.hasHitPlayer = true;
+      this.applyHit(e, p, m);
+    }
   }
 
   private updateHi() {
@@ -655,27 +1068,34 @@ export class Game {
 
   private applyHit(attacker: Fighter, victim: Fighter, move: MoveDef) {
     const isPlayerAttacking = attacker instanceof Player;
-    let dmg = move.dmg;
-    let kb = move.kb;
+    const victimEnemy = victim instanceof Enemy;
+    const isBoss = victimEnemy && victim.kind === "boss";
 
-    if (isPlayerAttacking) {
-      // bare-fist brawling — combo count drives the score
+    // boss ignores damage during his entrance / phase transitions
+    if (isBoss && victim.invulnT > 0) {
+      this.burst(victim.x, victim.y - victim.hh * 0.55, 3, "#ff5a3d", 90, 0.2);
+      this.audio.playSample("hitLight", rand(1.2, 1.4), 0.35);
+      return;
     }
 
-    const victimEnemy = victim instanceof Enemy;
     const armored = victimEnemy && victim.def.armor && victim.state === "attack";
 
-    if (!armored) {
-      victim.hp -= dmg;
+    if (isBoss) {
+      // super-armor: damage lands but the warlord never flinches; guarded swings take less
+      const guarding = victim.state === "attack" || victim.state === "dash" || victim.state === "windup";
+      victim.hp -= Math.round(move.dmg * (guarding ? 0.6 : 1));
+      victim.flashT = 0.12;
+    } else if (!armored) {
+      victim.hp -= move.dmg;
       victim.state = "hurt";
       victim.stateT = 0;
       victim.move = null;
-      victim.vx = attacker.facing * kb;
+      victim.vx = attacker.facing * move.kb;
       if (move.launcher) victim.vz = 265;
       victim.flashT = 0.12;
     } else {
       victim.flashT = 0.1;
-      victim.hp -= Math.round(dmg * 0.5);
+      victim.hp -= Math.round(move.dmg * 0.5);
     }
 
     // feedback
@@ -705,6 +1125,7 @@ export class Game {
       p.combo = 0;
       p.comboT = 0;
       p.meter = clamp(p.meter + 5, 0, 100);
+      p.invulnT = Math.max(p.invulnT, 0.6); // mercy window — no cheap stun-locks
       this.hurtFlashT = 0.25;
       this.audio.synth("hurt");
       if (p.hp <= 0) {
@@ -729,6 +1150,35 @@ export class Game {
         this.score += e.def.score;
         this.addText(e.x, e.y - 70, `K.O +${e.def.score}`, "#29e6ff", true);
         this.audio.synth("ko");
+      }
+      if (e.kind === "boss") {
+        // ── THE WARLORD FALLS ──
+        this.bossDefeated = true;
+        this.bossState = "defeated";
+        this.hitstop(0.5);
+        this.shake(8);
+        this.audio.playSample("hitHeavy", 0.8);
+        this.burst(e.x, e.y - e.hh * 0.5, 40, "#ff5a3d", 260, 0.7);
+        this.burst(e.x, e.y - e.hh * 0.3, 24, "#ffd98a", 190, 0.6);
+        this.burst(e.x, e.y - e.hh * 0.7, 18, "#ffffff", 150, 0.5);
+        this.showBanner("אדון הסערה הובס!", "הרחוב נקה מאימתו");
+        this.shockwaves = [];
+        // without their leader the gang scatters — leftovers drop
+        for (const m of this.enemies) {
+          if (m !== e && !m.dead) {
+            m.dead = true;
+            m.state = "dying";
+            m.stateT = 0;
+            m.move = null;
+            if (!m.scoreGiven) {
+              m.scoreGiven = true;
+              this.player.kills++;
+              const half = Math.round(m.def.score / 2);
+              this.score += half;
+              this.addText(m.x, m.y - 60, `+${half}`, "#29e6ff", false);
+            }
+          }
+        }
       }
     }
   }
@@ -826,12 +1276,14 @@ export class Game {
     for (const e of this.enemies) this.updateEnemy(e, dt);
     // remove fully gone enemies
     this.enemies = this.enemies.filter((e) => !e.gone);
+    this.updateBossEncounter(dt);
 
     // separation between enemies
     for (let i = 0; i < this.enemies.length; i++) {
       for (let j = i + 1; j < this.enemies.length; j++) {
         const a = this.enemies[i], b = this.enemies[j];
         if (a.dead || b.dead) continue;
+        if (a.kind === "boss" || b.kind === "boss") continue;
         const dx = b.x - a.x, dy = b.y - a.y;
         if (Math.abs(dx) < 48 && Math.abs(dy) < 22) {
           const push = (48 - Math.abs(dx)) * 0.5 * Math.sign(dx || 1);
@@ -1048,6 +1500,12 @@ export class Game {
       return;
     }
 
+    // the warlord runs his own brain
+    if (e.kind === "boss") {
+      this.updateBoss(e, dt);
+      return;
+    }
+
     if (e.state === "hurt") {
       e.x += e.vx * dt;
       e.vx *= Math.pow(0.004, dt);
@@ -1211,6 +1669,7 @@ export class Game {
     for (let i = this.bullets.length - 1; i >= 0; i--) {
       const b = this.bullets[i];
       b.x += b.vx * dt;
+      b.y += (b.vy ?? 0) * dt;
       b.life -= dt;
       if (b.life <= 0 || b.x < this.camX - 60 || b.x > this.camX + VIEW_W + 60) {
         this.bullets.splice(i, 1);
@@ -1570,22 +2029,47 @@ export class Game {
     ctx.globalAlpha = 1;
     ctx.textAlign = "left";
 
-    // gunner tracers
+    // gunner tracers (+ the boss's crimson fan bullets)
     ctx.save();
     for (const b of this.bullets) {
       const sx = b.x - this.camX;
+      const tint = b.tint ?? "#ffd98a";
+      const r = b.big ? 9 : 6;
       ctx.globalCompositeOperation = "lighter";
-      ctx.fillStyle = "rgba(255, 176, 46, 0.3)";
+      ctx.globalAlpha = 0.32;
+      ctx.fillStyle = tint;
       ctx.beginPath();
-      ctx.arc(sx, b.y, 6, 0, Math.PI * 2);
+      ctx.arc(sx, b.y, r, 0, Math.PI * 2);
       ctx.fill();
+      ctx.globalAlpha = 1;
       ctx.globalCompositeOperation = "source-over";
-      ctx.fillStyle = "#ffd98a";
-      ctx.fillRect(Math.round(sx - 5), Math.round(b.y - 1.5), 10, 3);
+      const w = b.big ? 7 : 5;
+      ctx.fillStyle = tint;
+      ctx.fillRect(Math.round(sx - w), Math.round(b.y - 1.5), w * 2, 3);
       ctx.fillStyle = "#fff6d8";
       ctx.fillRect(Math.round(sx - 2), Math.round(b.y - 0.5), 4, 1);
     }
     ctx.restore();
+
+    // slam shockwaves racing along the ground
+    for (const w of this.shockwaves) {
+      const sx = w.x - this.camX;
+      const age = clamp(1 - w.life / 1.5, 0, 1);
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      ctx.strokeStyle = `rgba(255, 130, 60, ${0.75 - age * 0.3})`;
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.arc(sx, Math.round(w.y), 9 + Math.sin(this.time * 22) * 2, Math.PI, 0);
+      ctx.stroke();
+      ctx.fillStyle = `rgba(255, 170, 80, ${0.6 - age * 0.25})`;
+      for (let i = 0; i < 3; i++) {
+        const fx = sx + Math.sin(this.time * 26 + i * 2.1) * 4;
+        const fh = 7 + ((this.time * 40 + i * 13) % 9);
+        ctx.fillRect(Math.round(fx - 1.5), Math.round(w.y - fh), 3, Math.round(fh));
+      }
+      ctx.restore();
+    }
   }
 
   private drawShadow(ctx: CanvasRenderingContext2D, x: number, y: number, w: number) {
@@ -1627,6 +2111,9 @@ export class Game {
       const visual = (e as Enemy & { visual?: string }).visual ?? "idle";
       if (st === "dying") { animName = "Death"; fps = 11; loop = false; }
       else if (st === "attack") { animName = e.move?.anim ?? "Attack1"; fps = e.move?.fps ?? 13; loop = false; }
+      else if (st === "dash") { animName = "Run"; fps = 22; }
+      else if (st === "slamJump" || st === "fan") { animName = e.move?.anim ?? "Attack2"; fps = 8; loop = false; }
+      else if (st === "transition") { animName = "Idle"; fps = 12; }
       else if (st === "windup") { animName = "Idle"; fps = 5; }
       else if (st === "hurt") { animName = "Take Hit"; fps = 11; loop = false; }
       else if (visual === "run") { animName = "Run"; fps = 12; }
@@ -1922,7 +2409,10 @@ export class Game {
     ctx.textAlign = "center";
     ctx.font = '700 10px Rubik, sans-serif';
     ctx.fillStyle = "#c8c4e0";
-    if (this.waveState === "go") {
+    if (this.waveState === "boss") {
+      ctx.fillStyle = Math.sin(this.time * 8) > 0 ? "#ff5a5a" : "#8a2020";
+      ctx.fillText("⚔ הקרב האחרון ⚔", VIEW_W / 2, 18);
+    } else if (this.waveState === "go") {
       ctx.fillStyle = Math.sin(this.time * 6) > 0 ? "#8dff5a" : "#4a7a3a";
       ctx.fillText("האזור פתוח — התקדם!", VIEW_W / 2, 18);
     } else {
@@ -1969,7 +2459,76 @@ export class Game {
       ctx.fillText("GO ▶▶", VIEW_W - 14, VIEW_H / 2);
     }
 
+    // ── boss health plate ──
+    if (this.waveState === "boss") this.drawBossBar(ctx);
+
     ctx.restore();
+  }
+
+  private drawBossBar(ctx: CanvasRenderingContext2D) {
+    const b = this.boss;
+    if (!b || b.gone || this.bossState === "defeated") return;
+    const bw = 236;
+    const bx = Math.round((VIEW_W - bw) / 2);
+    const by = 26;
+
+    // portrait crop from the boss sheet
+    const idle = this.assets?.enemies.boss["Idle"];
+    if (idle) {
+      ctx.fillStyle = "#1c0a10";
+      ctx.fillRect(bx - 26, by - 3, 24, 24);
+      ctx.drawImage(
+        idle.img,
+        idle.frameW * 0.3, idle.frameH * 0.08, idle.frameW * 0.4, idle.frameH * 0.4,
+        bx - 24, by - 1, 20, 20
+      );
+      ctx.strokeStyle = "#ff5a5a";
+      ctx.strokeRect(bx - 25.5, by - 2.5, 23, 23);
+    }
+
+    // name
+    ctx.textAlign = "center";
+    ctx.font = '700 10px Rubik, sans-serif';
+    ctx.fillStyle = "#ffd9e8";
+    ctx.fillText("אדון הסערה", VIEW_W / 2 + 12, by - 5);
+
+    // bar backing + ghost trail + hp
+    ctx.fillStyle = "rgba(6,3,8,0.8)";
+    ctx.fillRect(bx - 1, by - 1, bw + 2, 11);
+    const ghostR = clamp(this.bossGhostHp / b.maxHp, 0, 1);
+    ctx.fillStyle = "rgba(255,255,255,0.4)";
+    ctx.fillRect(bx + 1, by + 1, Math.round((bw - 2) * ghostR), 8);
+    const hpR = clamp(b.hp / b.maxHp, 0, 1);
+    const grad = ctx.createLinearGradient(bx, 0, bx + bw, 0);
+    grad.addColorStop(0, "#ff8a3d");
+    grad.addColorStop(1, "#c81e2e");
+    ctx.fillStyle = grad;
+    ctx.fillRect(bx + 1, by + 1, Math.round((bw - 2) * hpR), 8);
+    // phase threshold ticks (⅓ and ⅔)
+    ctx.strokeStyle = "rgba(6,3,8,0.9)";
+    ctx.lineWidth = 1.5;
+    for (const t of [1 / 3, 2 / 3]) {
+      const tx = bx + bw * t;
+      ctx.beginPath();
+      ctx.moveTo(tx, by); ctx.lineTo(tx, by + 10);
+      ctx.stroke();
+    }
+    ctx.strokeStyle = "#0a0408";
+    ctx.strokeRect(bx + 0.5, by + 0.5, bw - 1, 9);
+
+    // phase pips
+    for (let i = 1; i <= 3; i++) {
+      const px = bx + bw + 10 + (i - 1) * 8;
+      const on = i <= b.bossPhase;
+      ctx.fillStyle = on ? (b.bossPhase === 3 && Math.sin(this.time * 10) > 0 ? "#ffd98a" : "#ff5a3d") : "rgba(255,90,61,0.22)";
+      ctx.beginPath();
+      ctx.moveTo(px + 3, by + 2);
+      ctx.lineTo(px + 6, by + 5);
+      ctx.lineTo(px + 3, by + 8);
+      ctx.lineTo(px, by + 5);
+      ctx.closePath();
+      ctx.fill();
+    }
   }
 
   private drawBanner(ctx: CanvasRenderingContext2D) {

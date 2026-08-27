@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "smoke": "esbuild smoke/smoke.ts --bundle --platform=node --format=esm --outfile=smoke/smoke.mjs --log-level=warning && node smoke/smoke.mjs"
   },
   "dependencies": {
     "clsx": "2.1.1",
